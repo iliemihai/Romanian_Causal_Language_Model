@@ -4,7 +4,7 @@ from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
 from torch.nn import BCEWithLogitsLoss
 import pytorch_lightning as pl
-from transformers import AutoTokenizer, AutoModel, AutoConfig, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, Trainer, TrainingArguments
 from pytorch_lightning.callbacks import EarlyStopping
 from scipy.stats.stats import pearsonr
 from scipy.stats import spearmanr
@@ -16,15 +16,17 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class TransformerModel (pl.LightningModule):
-    def __init__(self, model_name="dumitrescustefan/bert-base-romanian-cased-v1", lr=2e-05, model_max_length=512):
+    def __init__(self, model_name="pt_model_1520000", lr=2e-05, model_max_length=512):
         super().__init__()
         print("Loading AutoModel [{}]...".format(model_name))
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cls_token="[CLS]", pad_token="[PAD]")
+        self.tokenizer.add_special_tokens({'cls_token': '[CLS]', 'pad_token': '[PAD]'})
         self.config = AutoConfig.from_pretrained(model_name, num_labels=1, output_hidden_states=True)
-        self.model = AutoModel.from_pretrained(model_name, config=self.config)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, config=self.config)
+        self.model.resize_token_embeddings(len(self.tokenizer))
         self.dropout = nn.Dropout(0.2)
-        self.linear = nn.Linear(768, 1)
+        self.linear = nn.Linear(1536, 16)
 
         self.loss_fct = BCEWithLogitsLoss()
 
@@ -42,11 +44,15 @@ class TransformerModel (pl.LightningModule):
         self.test_loss = []
 
         self.cnt = 0
+
+        # freeze parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
         
     def forward(self, text, rating):
-        o = self.model(input_ids=text["input_ids"].to(self.device), attention_mask=text["attention_mask"].to(self.device), return_dict=True)
-        pooled_sentence = o.last_hidden_state # [batch_size, seq_len, hidden_size]
-        pooled_sentence = torch.mean(pooled_sentence, dim=1) # [batch_size, hidden_size]
+        o = self.model(input_ids=text["input_ids"].to(self.device), attention_mask=text["attention_mask"].to(self.device), return_dict=True, output_hidden_states=True)
+        pooled_sentence = o.hidden_states[-1][0, -1, :] # [batch_size, seq_len, hidden_size]
+        #pooled_sentence = torch.mean(pooled_sentence, dim=1) # [batch_size, hidden_size]
 
         y_hat = self.linear(pooled_sentence).squeeze() # [batch_size]
         loss = self.loss_fct(y_hat, rating)
@@ -177,7 +183,7 @@ def my_collate(batch):
     ratings = []
     for instance in batch:
         #print(instance["text"])
-        text_batch.append(instance["text"])
+        text_batch.append(instance["text"]+" [CLS]")
         ratings.append(instance["rating"])
 
     text_batch = model.tokenizer(text_batch, padding=True, max_length = model.model_max_length, truncation=True, return_tensors="pt")
@@ -191,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument('--gpus', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--accumulate_grad_batches', type=int, default=16)
-    parser.add_argument('--model_name', type=str, default="dumitrescustefan/bert-base-romanian-cased-v1") #xlm-roberta-base
+    parser.add_argument('--model_name', type=str, default="pt_model_1520000") #xlm-roberta-base
     parser.add_argument('--lr', type=float, default=2e-05)
     parser.add_argument('--model_max_length', type=int, default=512)
     parser.add_argument('--experiment_iterations', type=int, default=1)
@@ -207,9 +213,9 @@ if __name__ == "__main__":
     val_dataset = MyDataset(tokenizer=model.tokenizer, file_path="./dataset/laroseda_test.json")
     test_dataset = MyDataset(tokenizer=model.tokenizer, file_path="./dataset/laroseda_val.json")
 
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, shuffle=True, collate_fn=my_collate, pin_memory=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, shuffle=False, collate_fn=my_collate, pin_memory=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, shuffle=False, collate_fn=my_collate, pin_memory=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, shuffle=True, collate_fn=my_collate, pin_memory=True, drop_last = True)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, shuffle=False, collate_fn=my_collate, pin_memory=True, drop_last = True)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, shuffle=False, collate_fn=my_collate, pin_memory=True, drop_last = True)
 
 
     print("Train dataset has {} instances.".format(len(train_dataset)))
@@ -243,7 +249,7 @@ if __name__ == "__main__":
             #limit_val_batches=2,
             accumulate_grad_batches=args.accumulate_grad_batches,
             gradient_clip_val=1.0,
-            checkpoint_callback=False
+            #checkpoint_callback=False
         )
         trainer.fit(model, train_dataloader, val_dataloader)
 
