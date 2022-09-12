@@ -53,9 +53,6 @@ class TransformerModel (pl.LightningModule):
                 param.requires_grad = False
         
     def forward(self, text, rating):
-        #print("AVEM", text["input_ids"].type(), text["attention_mask"].type())
-        #text["input_ids"] = text["input_ids"].type(torch.FloatTensor)
-        #text["attention_mask"] = text["attention_mask"].type(torch.FloatTensor)
         if self.full_train:
             o = self.model(input_ids=text["input_ids"].to(self.device),
                            attention_mask=text["attention_mask"].to(self.device), return_dict=True,
@@ -65,11 +62,7 @@ class TransformerModel (pl.LightningModule):
             o = self.model(input_ids=text["input_ids"].to(self.device),
                            attention_mask=text["attention_mask"].to(self.device), return_dict=True)
 
-            #pooled_sentence = torch.stack(o.hidden_states) # [num_hidden_states, batch_size, max_size, hidden_size]
-            #print("SHAPESS", pooled_sentence.shape)
-            pooled_sentence = o[2][-1] #pooled_sentence[-1] #torch.mean(pooled_sentence, dim=0) # [batch_size, max_size, hidden_size]
-            print("SHAPESS", pooled_sentence.shape)
-            #pooled_sentence = torch.mean(pooled_sentence, dim=1) # [batch_size, hidden_size]
+            pooled_sentence = o[2][-1] 
         y_hat = self.linear(pooled_sentence).squeeze()  # [batch_size]
         loss = self.loss_fct(y_hat, rating)
         return loss, y_hat
