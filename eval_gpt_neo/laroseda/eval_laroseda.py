@@ -2,33 +2,35 @@ import logging, os, sys, json, torch
 import torch.nn as nn
 from torch.utils.data.dataset import Dataset
 from torch.utils.data import DataLoader
-from torch.nn import BCEWithLogitsLoss
+from torch.nn import CrossEntropyLoss
 import pytorch_lightning as pl
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, Trainer, TrainingArguments
+from transformers import AutoTokenizer, AutoModel, AutoConfig, Trainer, TrainingArguments
 from pytorch_lightning.callbacks import EarlyStopping
 from scipy.stats.stats import pearsonr
 from scipy.stats import spearmanr
 
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.strategies import DeepSpeedStrategy
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class TransformerModel (pl.LightningModule):
-    def __init__(self, model_name="pt_model_1520000", lr=2e-05, model_max_length=512):
+    def __init__(self, model_name="pt_model_1520000", lr=2e-05, model_max_length=512, full_train=True):
         super().__init__()
         print("Loading AutoModel [{}]...".format(model_name))
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cls_token="[CLS]", pad_token="[PAD]")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name,  cls_token="[CLS]", pad_token="[PAD]")
         self.tokenizer.add_special_tokens({'cls_token': '[CLS]', 'pad_token': '[PAD]'})
+        self.full_train = full_train
         self.config = AutoConfig.from_pretrained(model_name, num_labels=1, output_hidden_states=True)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, config=self.config)
+        self.model = AutoModel.from_pretrained(model_name, config=self.config)
         self.model.resize_token_embeddings(len(self.tokenizer))
         self.dropout = nn.Dropout(0.2)
         self.linear = nn.Linear(1536, 16)
 
-        self.loss_fct = BCEWithLogitsLoss()
+        self.loss_fct = CrossEntropyLoss()
 
         self.lr = lr
         self.model_max_length = model_max_length
@@ -46,15 +48,29 @@ class TransformerModel (pl.LightningModule):
         self.cnt = 0
 
         # freeze parameters
-        for param in self.model.parameters():
-            param.requires_grad = False
+        if not self.full_train:
+            for param in self.model.parameters():
+                param.requires_grad = False
         
     def forward(self, text, rating):
-        o = self.model(input_ids=text["input_ids"].to(self.device), attention_mask=text["attention_mask"].to(self.device), return_dict=True, output_hidden_states=True)
-        pooled_sentence = o.hidden_states[-1][0, -1, :] # [batch_size, seq_len, hidden_size]
-        #pooled_sentence = torch.mean(pooled_sentence, dim=1) # [batch_size, hidden_size]
+        #print("AVEM", text["input_ids"].type(), text["attention_mask"].type())
+        #text["input_ids"] = text["input_ids"].type(torch.FloatTensor)
+        #text["attention_mask"] = text["attention_mask"].type(torch.FloatTensor)
+        if self.full_train:
+            o = self.model(input_ids=text["input_ids"].to(self.device),
+                           attention_mask=text["attention_mask"].to(self.device), return_dict=True,
+                           output_hidden_states=True)
+            pooled_sentence = o.hidden_states[-1][0, -1, :]  # [batch_size, seq_len, hidden_size]
+        else:
+            o = self.model(input_ids=text["input_ids"].to(self.device),
+                           attention_mask=text["attention_mask"].to(self.device), return_dict=True)
 
-        y_hat = self.linear(pooled_sentence).squeeze() # [batch_size]
+            #pooled_sentence = torch.stack(o.hidden_states) # [num_hidden_states, batch_size, max_size, hidden_size]
+            #print("SHAPESS", pooled_sentence.shape)
+            pooled_sentence = o[2][-1] #pooled_sentence[-1] #torch.mean(pooled_sentence, dim=0) # [batch_size, max_size, hidden_size]
+            print("SHAPESS", pooled_sentence.shape)
+            #pooled_sentence = torch.mean(pooled_sentence, dim=1) # [batch_size, hidden_size]
+        y_hat = self.linear(pooled_sentence).squeeze()  # [batch_size]
         loss = self.loss_fct(y_hat, rating)
         return loss, y_hat
 
@@ -150,7 +166,7 @@ class MyDataset(Dataset):
         for line in lines["reviews"]:
             text = f'{line["title"]} {line["content"]}'
             rating = int(line['starRating']) - 1
-            rating = int(rating > 2)
+            #rating = int(rating > 2)
 
             instance = {
                 "text": text,
@@ -162,8 +178,11 @@ class MyDataset(Dataset):
         return len(self.instances)
 
     def __getitem__(self, i):
-        return self.instances[i] #torch.tensor([0], dtype=torch.long)
+        return self.instances[i] #torch.tensor([0], dtype=torch.float32)
 
+
+tokenizer = AutoTokenizer.from_pretrained("pt_model_1520000", cls_token="[CLS]", pad_token="[PAD]")
+tokenizer.add_special_tokens({'cls_token': '[CLS]', 'pad_token': '[PAD]'})
 
 def my_collate(batch):
     # batch is a list of batch_size number of instances; each instance is a dict, as given by MyDataset.__getitem__()
@@ -186,9 +205,9 @@ def my_collate(batch):
         text_batch.append(instance["text"]+" [CLS]")
         ratings.append(instance["rating"])
 
-    text_batch = model.tokenizer(text_batch, padding=True, max_length = model.model_max_length, truncation=True, return_tensors="pt")
+    text_batch = tokenizer(text_batch,
+                           max_length=512, truncation=True, pad_to_max_length=True, add_special_tokens=True, return_tensors="pt")
     ratings = torch.tensor(ratings, dtype=torch.float)
-
     return text_batch, ratings
 
 if __name__ == "__main__":
@@ -207,11 +226,10 @@ if __name__ == "__main__":
     print("Batch size is {}, accumulate grad batches is {}, final batch_size is {}\n".format(args.batch_size, args.accumulate_grad_batches, args.batch_size * args.accumulate_grad_batches))
     
     model = TransformerModel(model_name=args.model_name, lr=args.lr, model_max_length=args.model_max_length) # need to load for tokenizer
-    
     print("Loading data...")
-    train_dataset = MyDataset(tokenizer=model.tokenizer, file_path="./dataset/laroseda_train.json")
-    val_dataset = MyDataset(tokenizer=model.tokenizer, file_path="./dataset/laroseda_test.json")
-    test_dataset = MyDataset(tokenizer=model.tokenizer, file_path="./dataset/laroseda_val.json")
+    train_dataset = MyDataset(tokenizer=tokenizer, file_path="./dataset/laroseda_train.json")
+    val_dataset = MyDataset(tokenizer=tokenizer, file_path="./dataset/laroseda_test.json")
+    test_dataset = MyDataset(tokenizer=tokenizer, file_path="./dataset/laroseda_val.json")
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, shuffle=True, collate_fn=my_collate, pin_memory=True, drop_last = True)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, shuffle=False, collate_fn=my_collate, pin_memory=True, drop_last = True)
@@ -243,14 +261,27 @@ if __name__ == "__main__":
         )
         
         trainer = pl.Trainer(
-            gpus=args.gpus,
+            accelerator="gpu",
+            devices=1,
+            #gpus=1,
             callbacks=[early_stop],
             #limit_train_batches=5,
             #limit_val_batches=2,
+            strategy="deepspeed_stage_3_offload",
+            #strategy=DeepSpeedStrategy(
+            #    stage=3,
+            #    offload_optimizer=True,
+            #    offload_parameters=True,
+            #    remote_device="nvme",
+            #    offload_params_device="nvme",
+            #    offload_optimizer_device="nvme",
+            #    nvme_path="/home/sustadmin/",
+            #),
             accumulate_grad_batches=args.accumulate_grad_batches,
             gradient_clip_val=1.0,
             #checkpoint_callback=False
         )
+
         trainer.fit(model, train_dataloader, val_dataloader)
 
         resultd = trainer.test(model, val_dataloader)
@@ -282,3 +313,4 @@ if __name__ == "__main__":
         json.dump(result, f, indent=4, sort_keys=True)
         
     print(result)
+
